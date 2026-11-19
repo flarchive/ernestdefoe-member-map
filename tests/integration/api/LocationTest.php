@@ -1,0 +1,308 @@
+<?php
+
+namespace ErnestDefoe\MemberMap\Tests\integration\api;
+
+use ErnestDefoe\MemberMap\Geocoder;
+use ErnestDefoe\MemberMap\Location;
+use ErnestDefoe\MemberMap\Tests\fixtures\FakeGeocoder;
+use Flarum\Group\Group;
+use Flarum\Testing\integration\RetrievesAuthorizedUsers;
+use Flarum\Testing\integration\TestCase;
+use Flarum\User\User;
+use PHPUnit\Framework\Attributes\Test;
+
+class LocationTest extends TestCase
+{
+    use RetrievesAuthorizedUsers;
+
+    private FakeGeocoder $geocoder;
+
+    protected function setUp(): void
+    {
+        parent::setUp();
+
+        $this->extension('ernestdefoe-member-map');
+
+        $this->prepareDatabase([
+            User::class => [$this->normalUser(), ['id' => 3, 'username' => 'other', 'email' => 'other@machine.local', 'is_email_confirmed' => 1]],
+            'group_permission' => [
+                ['group_id' => Group::MEMBER_ID, 'permission' => 'member-map.view'],
+                ['group_id' => Group::MEMBER_ID, 'permission' => 'member-map.list'],
+            ],
+        ]);
+    }
+
+    private function fake(): FakeGeocoder
+    {
+        $container = $this->app()->getContainer();
+        $this->geocoder = $container->make(FakeGeocoder::class);
+        $container->instance(Geocoder::class, $this->geocoder);
+
+        return $this->geocoder;
+    }
+
+    /**
+     * A new point is a POST (it replaces the member's place); only who sees it is a PATCH.
+     *
+     * @return array{int, array<string, mixed>|null} the status and the answer, its attributes as `place`
+     */
+    private function post(array $attributes, ?int $as = 2): array
+    {
+        $create = array_key_exists('lat', $attributes);
+        $request = $this->request($create ? 'POST' : 'PATCH', '/api/member-map-locations'.($create ? '' : '/'.$as), array_filter([
+            'authenticatedAs' => $as,
+            'json' => ['data' => array_filter(['type' => 'member-map-locations', 'id' => $create ? null : (string) $as, 'attributes' => $attributes])],
+        ]));
+        $response = $this->send($request);
+        $body = json_decode((string) $response->getBody(), true);
+        if (isset($body['data']['attributes'])) {
+            $body['place'] = $body['data']['attributes'];
+        }
+
+        return [$response->getStatusCode(), $body];
+    }
+
+    #[Test]
+    public function saving_stores_the_rounded_centre_of_the_city_never_the_point_sent()
+    {
+        $this->fake();
+
+        [$status, $body] = $this->post(['lat' => 36.15123, 'lng' => -86.78456, 'precision' => 'city', 'profile' => true]);
+
+        $this->assertSame(201, $status);
+        $this->assertSame('Nashville, United States', $body['place']['label']);
+
+        $row = Location::find(2);
+        $this->assertSame(36.16, $row->lat);
+        $this->assertSame(-86.77, $row->lng);
+        $this->assertSame('city', $row->precision);
+        $this->assertSame('us', $row->country_code);
+        // No browser zone sent: Tennessee's own zone, from its ISO code.
+        $this->assertSame('America/Chicago', $row->timezone);
+    }
+
+    #[Test]
+    public function the_browser_time_zone_is_used_only_when_it_belongs_to_the_country()
+    {
+        $this->fake();
+
+        $this->post(['lat' => 36.15, 'lng' => -86.78, 'precision' => 'city', 'browserTimezone' => 'America/Indiana/Tell_City']);
+        $this->assertSame('America/Indiana/Tell_City', Location::find(2)->timezone);
+
+        $this->post(['lat' => 36.15, 'lng' => -86.79, 'precision' => 'city', 'browserTimezone' => 'Europe/Paris']);
+        $this->assertSame('America/Chicago', Location::find(2)->timezone);
+    }
+
+    #[Test]
+    public function members_only_and_the_profile_switch_change_without_a_lookup()
+    {
+        $geocoder = $this->fake();
+        $this->post(['lat' => 36.15, 'lng' => -86.78, 'precision' => 'city']);
+
+        [$status, $body] = $this->post(['membersOnly' => true]);
+
+        $this->assertSame(200, $status);
+        $this->assertTrue($body['place']['membersOnly']);
+        $this->assertTrue(Location::find(2)->members_only);
+        $this->assertSame(1, $geocoder->calls);
+    }
+
+    #[Test]
+    public function region_and_country_save_their_own_centres_rounded_to_one_decimal()
+    {
+        $this->fake();
+
+        $this->post(['lat' => 36.15123, 'lng' => -86.78456, 'precision' => 'region']);
+        $this->assertSame([35.8, -86.3, 'Tennessee, United States'], [Location::find(2)->lat, Location::find(2)->lng, Location::find(2)->label]);
+
+        $this->post(['lat' => 36.15123, 'lng' => -86.78456, 'precision' => 'country']);
+        $this->assertSame([39.8, -100.4, 'United States'], [Location::find(2)->lat, Location::find(2)->lng, Location::find(2)->label]);
+    }
+
+    #[Test]
+    public function a_point_with_no_place_saves_nothing()
+    {
+        $this->fake();
+
+        [$status, $body] = $this->post(['lat' => -40, 'lng' => -120, 'precision' => 'city']);
+
+        $this->assertSame(422, $status);
+        $this->assertSame('member_map_no_place', $body['errors'][0]['code']);
+        $this->assertNull(Location::find(2));
+    }
+
+    #[Test]
+    public function bad_input_is_refused_before_any_lookup()
+    {
+        $geocoder = $this->fake();
+
+        foreach ([['lat' => 91, 'lng' => 0, 'precision' => 'city'], ['lat' => 1, 'lng' => 2, 'precision' => 'street'], ['lat' => 'x', 'lng' => 2, 'precision' => 'city']] as $body) {
+            $this->assertSame(422, $this->post($body)[0]);
+        }
+        $this->assertSame(0, $geocoder->calls);
+    }
+
+    #[Test]
+    public function a_longitude_from_a_map_scrolled_round_the_world_is_wrapped()
+    {
+        $geocoder = $this->fake();
+
+        $this->assertSame(201, $this->post(['lat' => 36.15, 'lng' => 273.22, 'precision' => 'city'])[0]);
+        $this->assertSame(1, $geocoder->calls);
+    }
+
+    #[Test]
+    public function guests_cannot_save()
+    {
+        $this->fake();
+
+        // A guest never reaches the resource: no CSRF token, no session.
+        $this->assertContains($this->post(['lat' => 36, 'lng' => -86, 'precision' => 'city'], null)[0], [400, 401]);
+    }
+
+    #[Test]
+    public function members_without_the_permission_cannot_save()
+    {
+        $this->database()->table('group_permission')->where('permission', 'member-map.list')->delete();
+        $this->fake();
+        $this->assertSame(403, $this->post(['lat' => 36, 'lng' => -86, 'precision' => 'city'])[0]);
+    }
+
+    #[Test]
+    public function the_profile_switch_alone_changes_without_a_lookup()
+    {
+        $geocoder = $this->fake();
+        $this->post(['lat' => 36.15, 'lng' => -86.78, 'precision' => 'city', 'profile' => true]);
+
+        [$status, $body] = $this->post(['profile' => false]);
+
+        $this->assertSame(200, $status);
+        $this->assertFalse($body['place']['profile']);
+        $this->assertFalse(Location::find(2)->show_on_profile);
+        $this->assertSame(1, $geocoder->calls);
+    }
+
+    #[Test]
+    public function the_same_place_is_looked_up_once()
+    {
+        $geocoder = $this->fake();
+
+        $this->post(['lat' => 36.15, 'lng' => -86.78, 'precision' => 'city']);
+        $this->post(['lat' => 36.15, 'lng' => -86.78, 'precision' => 'city']);
+
+        $this->assertSame(1, $geocoder->calls);
+    }
+
+    #[Test]
+    public function a_geocoder_that_is_down_answers_503_and_saves_nothing()
+    {
+        $this->fake()->down = true;
+
+        [$status, $body] = $this->post(['lat' => 36.15, 'lng' => -86.78, 'precision' => 'city']);
+
+        $this->assertSame(503, $status);
+        $this->assertSame('member_map_unavailable', $body['errors'][0]['code']);
+        $this->assertNull(Location::find(2));
+    }
+
+    #[Test]
+    public function leaving_the_map_works_even_without_the_permission()
+    {
+        $this->fake();
+        $this->post(['lat' => 36.15, 'lng' => -86.78, 'precision' => 'city']);
+        $this->database()->table('group_permission')->where('permission', 'member-map.list')->delete();
+
+        $response = $this->send($this->request('DELETE', '/api/member-map-locations/2', ['authenticatedAs' => 2]));
+
+        $this->assertSame(204, $response->getStatusCode());
+        $this->assertNull(Location::find(2));
+    }
+
+    #[Test]
+    public function search_needs_two_letters_and_is_rate_limited_per_member()
+    {
+        $this->fake();
+
+        $search = fn (string $q) => $this->send($this->request('GET', '/api/member-map/geocode', ['authenticatedAs' => 2])->withQueryParams(['q' => $q]));
+
+        $this->assertSame(422, $search('N')->getStatusCode());
+
+        $first = $search('Nashville');
+        $this->assertSame(200, $first->getStatusCode());
+        $this->assertSame('Nashville, Davidson County, Tennessee, United States', json_decode((string) $first->getBody(), true)['places'][0]['label']);
+
+        // Answers already looked up cost nothing; new lookups count, 15 a minute.
+        $this->assertSame(200, $search('Nashville')->getStatusCode());
+        $statuses = [];
+        for ($i = 0; $i < 15; $i++) {
+            $statuses[] = $search("Nashville $i")->getStatusCode();
+        }
+        $this->assertContains(429, $statuses);
+    }
+
+    #[Test]
+    public function saving_again_moves_the_one_place_a_member_has()
+    {
+        $this->fake();
+
+        $this->assertSame(201, $this->post(['lat' => 36.15, 'lng' => -86.78, 'precision' => 'city'])[0]);
+        $this->assertSame(201, $this->post(['lat' => 36.15, 'lng' => -86.78, 'precision' => 'country'])[0]);
+
+        $this->assertSame(1, Location::query()->where('user_id', 2)->count());
+        $this->assertSame('country', Location::find(2)->precision);
+    }
+
+    #[Test]
+    public function nobody_can_change_or_remove_another_members_place()
+    {
+        $this->fake();
+        $this->post(['lat' => 36.15, 'lng' => -86.78, 'precision' => 'city']);
+
+        $patch = $this->request('PATCH', '/api/member-map-locations/2', ['authenticatedAs' => 3, 'json' => ['data' => ['type' => 'member-map-locations', 'id' => '2', 'attributes' => ['profile' => false]]]]);
+        $this->assertSame(404, $this->send($patch)->getStatusCode());
+        $this->assertSame(404, $this->send($this->request('DELETE', '/api/member-map-locations/2', ['authenticatedAs' => 3]))->getStatusCode());
+        $this->assertTrue(Location::find(2)->show_on_profile);
+    }
+
+    #[Test]
+    public function a_lookup_under_a_second_after_the_last_is_refused_at_once_instead_of_waiting()
+    {
+        $geocoder = $this->fake();
+        $geocoder->throttled = true;
+
+        $this->assertSame(201, $this->post(['lat' => 36.15, 'lng' => -86.78, 'precision' => 'city'])[0]);
+
+        $started = microtime(true);
+        [$status, $body] = $this->post(['lat' => 36.15, 'lng' => -86.78, 'precision' => 'region']);
+
+        $this->assertSame(429, $status);
+        $this->assertSame('member_map_busy', $body['errors'][0]['code']);
+        $this->assertLessThan(0.5, microtime(true) - $started, 'The request did not wait for its turn.');
+        $this->assertSame(1, $geocoder->calls);
+    }
+
+    #[Test]
+    public function with_a_real_queue_the_request_never_calls_the_provider_itself()
+    {
+        $queue = new \Illuminate\Support\Testing\Fakes\QueueFake($this->app()->getContainer());
+        $this->app()->getContainer()->instance(\Illuminate\Contracts\Queue\Queue::class, $queue);
+        // The geocoder was built with the real queue: build it again with the fake one.
+        $geocoder = $this->fake();
+
+        $search = fn () => $this->send($this->request('GET', '/api/member-map/geocode', ['authenticatedAs' => 2])->withQueryParams(['q' => 'Nashville']));
+
+        $first = $search();
+        $this->assertSame(429, $first->getStatusCode());
+        $this->assertSame('member_map_busy', json_decode((string) $first->getBody(), true)['errors'][0]['code']);
+        $this->assertSame(0, $geocoder->calls);
+        $queue->assertPushed(\ErnestDefoe\MemberMap\Job\LookUpPlace::class, 1);
+
+        // The worker runs the lookup; the member's next ask is answered from the cache.
+        $queue->pushed(\ErnestDefoe\MemberMap\Job\LookUpPlace::class)->first()->handle($geocoder);
+        $this->assertSame(1, $geocoder->calls);
+
+        $second = $search();
+        $this->assertSame(200, $second->getStatusCode());
+        $this->assertSame('Nashville, Davidson County, Tennessee, United States', json_decode((string) $second->getBody(), true)['places'][0]['label']);
+    }
+}
