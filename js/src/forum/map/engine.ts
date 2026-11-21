@@ -1,0 +1,220 @@
+import app from 'flarum/forum/app';
+import * as maplibregl from 'maplibre-gl';
+import css from './mapCss';
+// @ts-ignore a string, from webpack.config.js
+import workerSource from 'maplibre-gl/dist/maplibre-gl-worker.mjs?worker-source';
+import { isDark } from '../theme';
+
+/*
+ * The map engine: MapLibre GL with OpenStreetMap-based vector tiles
+ * (OpenFreeMap by default, no key), on a globe. This module is its own chunk
+ * (forum/map/engine), imported dynamically by the map page and the location
+ * forms: no other page downloads it.
+ *
+ * If the vector style can't load, the map falls back to the raster tiles the
+ * admin set (OpenStreetMap's by default), drawn by the same engine.
+ */
+
+let injected = false;
+let worker: string | null = null;
+
+/**
+ * MapLibre's worker, started from a blob of its code. The code is bundled in
+ * this chunk as a string (webpack.config.js, `?worker-source`), so the map
+ * needs no file of its own on the forum: Flarum, a CDN or a subfolder install
+ * can't leave it unpublished or at another address. Call (and wait for) this
+ * before the first map.
+ */
+export async function prepare(): Promise<void> {
+  if (worker) return;
+  await blobWorkersAllowed();
+  worker = URL.createObjectURL(new Blob([workerSource], { type: 'text/javascript' }));
+  maplibregl.setWorkerUrl(worker);
+}
+
+/**
+ * A Content-Security-Policy without blob: in worker-src (or script-src) blocks
+ * the worker, and MapLibre only reports that later as a map error, leaving a
+ * blank map. A tiny worker started the same way finds out first, so callers
+ * can show the list instead.
+ */
+function blobWorkersAllowed(): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const url = URL.createObjectURL(new Blob(['postMessage(1)'], { type: 'text/javascript' }));
+    let probe: Worker;
+    const done = (error?: Error) => {
+      clearTimeout(timer);
+      probe?.terminate();
+      URL.revokeObjectURL(url);
+      error ? reject(error) : resolve();
+    };
+    const timer = setTimeout(() => done(new Error('Map worker did not start (Content-Security-Policy?)')), 5000);
+    try {
+      probe = new Worker(url);
+    } catch (error) {
+      return done(error as Error);
+    }
+    probe.onmessage = () => done();
+    probe.onerror = () => done(new Error('Map worker blocked (Content-Security-Policy worker-src needs blob:)'));
+  });
+}
+
+function ensureCss(): void {
+  if (injected) return;
+  injected = true;
+  const style = document.createElement('style');
+  style.id = 'member-map-maplibre-css';
+  style.textContent = css;
+  document.head.prepend(style);
+}
+
+/** Whether this browser can draw the map at all. Without WebGL the page shows its list instead. */
+export function supported(): boolean {
+  try {
+    const canvas = document.createElement('canvas');
+    return !!(canvas.getContext('webgl2') || canvas.getContext('webgl'));
+  } catch {
+    return false;
+  }
+}
+
+function rasterStyle(): maplibregl.StyleSpecification {
+  const url = app.forum.attribute<string>('memberMapTiles');
+  return {
+    version: 8,
+    sources: {
+      raster: { type: 'raster', tiles: [url], tileSize: 256, maxzoom: 19, attribution: app.forum.attribute<string>('memberMapAttribution') },
+    },
+    layers: [{ id: 'raster', type: 'raster', source: 'raster' }],
+  };
+}
+
+function styleUrl(dark: boolean): string | null {
+  const light = app.forum.attribute<string | null>('memberMapStyle');
+  return (dark && app.forum.attribute<string | null>('memberMapStyleDark')) || light;
+}
+
+/** Place names in the forum's language where the map has them, else in Latin letters, else as written locally. */
+function localizeLabels(map: maplibregl.Map): void {
+  const locale = (app.translator.getLocale() || 'en').split('-')[0];
+  const name = ['coalesce', ['get', `name:${locale}`], ['get', 'name:latin'], ['get', 'name']];
+  for (const layer of map.getStyle().layers || []) {
+    if (layer.type !== 'symbol') continue;
+    const field = JSON.stringify(map.getLayoutProperty(layer.id, 'text-field') ?? '');
+    if (field.includes('name')) map.setLayoutProperty(layer.id, 'text-field', name as any);
+  }
+}
+
+export interface MapOptions {
+  center?: [number, number];
+  zoom?: number;
+  globe?: boolean;
+  /** Called after every style load (first load and each light/dark switch): add sources and layers here. */
+  onStyle?: (map: maplibregl.Map) => void;
+}
+
+export interface MapHandle {
+  map: maplibregl.Map;
+  destroy: () => void;
+}
+
+/** Which style is showing: dark or light, vector or the raster fallback. */
+interface StyleState {
+  dark: boolean;
+  raster: boolean;
+}
+
+function newMap(container: HTMLElement, options: MapOptions, state: StyleState): maplibregl.Map {
+  const map = new maplibregl.Map({
+    container,
+    style: state.raster ? rasterStyle() : (styleUrl(state.dark) as string),
+    center: options.center ?? [0, 20],
+    zoom: options.zoom ?? 1.4,
+    minZoom: 0.5,
+    // Places are city centres: closer than this shows nothing more.
+    maxZoom: 13,
+    dragRotate: false,
+    pitchWithRotate: false,
+    touchPitch: false,
+    attributionControl: { compact: true },
+    // 🚨 Flarum sends `Referrer-Policy: same-origin`, so tile requests would carry no Referer, and
+    // OpenStreetMap answers those with an "Access blocked" picture. Send the forum's origin, nothing more.
+    transformRequest: (url: string) => ({ url, referrerPolicy: 'strict-origin-when-cross-origin' as ReferrerPolicy }),
+    cooperativeGestures: false,
+  });
+  map.touchZoomRotate.disableRotation();
+  map.keyboard.disableRotation();
+  map.addControl(new maplibregl.NavigationControl({ showCompass: false }), 'top-right');
+
+  // MapLibre opens its compact credit expanded; on a phone that covers the map's foot, links and all.
+  map.once('load', () => container.querySelector('.maplibregl-ctrl-attrib')?.classList.remove('maplibregl-compact-show'));
+
+  map.on('style.load', () => {
+    if (options.globe !== false) map.setProjection({ type: 'globe' });
+    localizeLabels(map);
+    options.onStyle?.(map);
+  });
+
+  return map;
+}
+
+/**
+ * The vector style or its tiles are unreachable (anything failing before the
+ * first full load, or repeated tile failures after): draw the raster tiles instead.
+ */
+function fallBackToRaster(map: maplibregl.Map, container: HTMLElement, state: StyleState): void {
+  let loaded = false;
+  let failures = 0;
+  map.once('load', () => (loaded = true));
+  map.on('error', () => {
+    if (state.raster || (loaded && ++failures < 4)) return;
+    state.raster = true;
+    container.classList.toggle('MemberMap--rasterDark', state.dark);
+    map.setStyle(rasterStyle());
+  });
+}
+
+/** Follows the forum's light and dark mode as it changes; returns the function that stops following. */
+function followTheme(map: maplibregl.Map, container: HTMLElement, state: StyleState): () => void {
+  const follow = () => {
+    const now = isDark();
+    if (now === state.dark) return;
+    state.dark = now;
+    container.classList.toggle('MemberMap--rasterDark', state.raster && state.dark);
+    if (!state.raster && styleUrl(state.dark) !== styleUrl(!state.dark)) map.setStyle(styleUrl(state.dark) as string);
+  };
+  const observer = new MutationObserver(follow);
+  observer.observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme', 'class', 'style'] });
+  const media = window.matchMedia('(prefers-color-scheme: dark)');
+  media.addEventListener('change', follow);
+
+  return () => {
+    observer.disconnect();
+    media.removeEventListener('change', follow);
+  };
+}
+
+export function createMap(container: HTMLElement, options: MapOptions = {}): MapHandle {
+  ensureCss();
+
+  const dark = isDark();
+  const state: StyleState = { dark, raster: !styleUrl(dark) };
+  const map = newMap(container, options, state);
+  container.classList.toggle('MemberMap--rasterDark', state.raster && state.dark);
+  fallBackToRaster(map, container, state);
+  const unfollow = followTheme(map, container, state);
+
+  return {
+    map,
+    destroy: () => {
+      unfollow();
+      map.remove();
+    },
+  };
+}
+
+export function reducedMotion(): boolean {
+  return window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+}
+
+export default maplibregl;

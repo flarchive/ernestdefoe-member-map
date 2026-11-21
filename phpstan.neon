@@ -1,0 +1,28 @@
+includes:
+    - vendor/flarum/phpstan/extension.neon
+
+parameters:
+    # One process: flarum/phpstan's bootstrap installs a test forum the first
+    # time it runs, and parallel workers each start that install at once on a
+    # fresh checkout (CI), failing with Install\StepFailed.
+    parallel:
+        maximumNumberOfProcesses: 1
+    level: 6
+    paths:
+        - extend.php
+        - src
+        # Read for the followedUsers relationship it registers (FollowUsersFollows); its own code isn't ours to check.
+        - vendor/ianm/follow-users/extend.php
+    ignoreErrors:
+        -
+            message: '#.*#'
+            path: vendor/ianm/follow-users/extend.php
+            reportUnmatched: false
+        # Page Builder is a private package: its extender is only built when it is enabled (Extend\Conditional).
+        -
+            identifier: class.notFound
+            message: '#Ernestdefoe\\PageBuilder\\Extend\\PageBuilderBlock#'
+            path: extend.php
+    excludePaths:
+        # Implements Page Builder's interface; loaded only when Page Builder is installed.
+        - src/Widget/WhereWeAreBlock.php
